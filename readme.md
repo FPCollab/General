@@ -1,3 +1,5 @@
 Facepunch Collaboration Repositories
 ==============================================
-Aye, so what do we put here?
+So what do we put in this repository?
+
+Is it really needed?
