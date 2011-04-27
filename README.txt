@@ -1,1 +1,0 @@
-Put any projects in this repo which you don't feel need their own repo.
