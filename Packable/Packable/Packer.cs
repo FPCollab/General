@@ -4,8 +4,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
-using System.Reflection.Emit;
-using System.Threading;
 using Packable.StreamBinary;
 using Packable.StreamBinary.Generic;
 
@@ -13,31 +11,105 @@ namespace Packable
 {
     public abstract class BasePackable : IPackable
     {
-        static Dictionary<Type, CachedReadWrite> TypeCache = new Dictionary<Type, CachedReadWrite>();
+        protected static Dictionary<Type, Func<BasePackable, Type, Stream, object>> UnpackInterfaces = new Dictionary<Type, Func<BasePackable, Type, Stream, object>>();
+        protected static Dictionary<Type, Action<BasePackable, Type, Stream, object>> PackInterfaces = new Dictionary<Type, Action<BasePackable, Type, Stream, object>>();
+
+        static Dictionary<Type, CachedType> TypeCache = new Dictionary<Type, CachedType>();
+        static Dictionary<Type, List<CachedMember>> MemberCache = new Dictionary<Type, List<CachedMember>>();
 
         static BasePackable()
         {
+            UnpackInterfaces.Add(typeof(IPackable), delegate(BasePackable self, Type type, Stream s)
+            {
+                var obj = (IPackable)Activator.CreateInstance(type);
+                obj.Unpack(s);
+                return obj;
+            });
+            UnpackInterfaces.Add(typeof(IList), delegate(BasePackable self, Type type, Stream s)
+            {
+                Type valuetype = type.IsGenericType
+                                    ? type.GetGenericArguments()[0]
+                                    : typeof(object);
+                var collection = (IList)Activator.CreateInstance(type);
+                int count = s.ReadInt32();
+                for (int i = 0; i < count; i++)
+                {
+                    collection.Add(self.Unpack(s, valuetype));
+                }
+                return collection;
+            });
+            UnpackInterfaces.Add(typeof(IDictionary), delegate(BasePackable self, Type type, Stream s)
+            {
+                Type keytype = type.IsGenericType ? type.GetGenericArguments()[0] : typeof(object);
+                Type valuetype = type.IsGenericType ? type.GetGenericArguments()[1] : typeof(object);
+                var dictionary = (IDictionary)Activator.CreateInstance(type);
+                int count = s.ReadInt32();
+                for (int i = 0; i < count; i++)
+                {
+                    object key = self.Unpack(s, keytype);
+                    object val = self.Unpack(s, valuetype);
+                    dictionary.Add(key, val);
+                }
+                return dictionary;
+            });
+
+            PackInterfaces.Add(typeof(IPackable), delegate(BasePackable self, Type type, Stream s, object obj)
+            {
+                ((IPackable)obj).Pack(s);
+            });
+            PackInterfaces.Add(typeof(IList), delegate(BasePackable self, Type type, Stream s, object obj)
+            {
+                var collection = (IList)obj;
+                s.Write((Int32)collection.Count);
+                for (int i = 0; i < collection.Count; i++)
+                    self.Pack(s, collection[i]);
+            });
+            PackInterfaces.Add(typeof(IDictionary), delegate(BasePackable self, Type type, Stream s, object obj)
+            {
+                var dictionary = (IDictionary)obj;
+                s.Write((Int32)dictionary.Count);
+                foreach (var key in dictionary.Keys)
+                {
+                    self.Pack(s, key);
+                    self.Pack(s, dictionary[key]);
+                }
+            });
         }
         protected BasePackable()
         {
 
         }
 
-        CachedReadWrite GetCachedType(Type type)
+        List<CachedMember> GetCachedMembers(Type type)
         {
-            lock (TypeCache)
+            if (!MemberCache.ContainsKey(type))
             {
-                CachedReadWrite ret;
-                if (!TypeCache.TryGetValue(type, out ret))
-                    TypeCache.Add(type, ret = new CachedReadWrite(type));
-                return ret;
+                lock (MemberCache)
+                {
+                    if (!MemberCache.ContainsKey(type))
+                        MemberCache.Add(type, GetTypeCachedMembers(type));
+                }
             }
+            return MemberCache[type];
+
+        }
+        CachedType GetCachedType(Type type)
+        {
+            if (!TypeCache.ContainsKey(type))
+            {
+                lock (TypeCache)
+                {
+                    if (!TypeCache.ContainsKey(type))
+                        TypeCache.Add(type, new CachedType(type));
+                }
+            }
+            return TypeCache[type];
         }
 
-        static List<MemberInfo> GetMembers(Type type)
+
+        List<CachedMember> GetTypeCachedMembers(Type type)
         {
-            var ret = new List<MemberInfo>();
-            bool serialize = true;
+            var ret = new List<CachedMember>();
             MemberInfo[] members = type.GetMembers(BindingFlags.Instance | BindingFlags.Public);
             foreach (MemberInfo member in members)
             {
@@ -51,24 +123,11 @@ namespace Packable
                         continue;
                 }
 
-                var pack =
-                    (PackAttribute)
-                    member.GetCustomAttributes(false).FirstOrDefault(
-                        o => o.GetType() == typeof(PackAttribute) || o.GetType() == typeof(DontPackAttribute));
-
-                if (pack != null && pack.Fall)
-                    serialize = !pack.Dont;
-
-                if (pack != null && pack.Dont)
-                    continue;
-
-                if (serialize || (pack != null && !pack.Dont))
+                if (member.GetCustomAttributes(typeof(DontPackAttribute), false).Length == 0)
                 {
-                    ret.Add(member);
+                    ret.Add(new CachedMember(member));
                 }
             }
-
-            //ret.Sort((o1, o2) => o1.MetadataToken.CompareTo(o2.MetadataToken));
 
             return ret;
         }
@@ -91,185 +150,207 @@ namespace Packable
 
         public virtual void Pack(Stream stream)
         {
-            var c = GetCachedType(GetType());
-            c.Write(this, stream);
+            List<CachedMember> members = GetCachedMembers(GetType());
+            foreach (CachedMember member in members)
+            {
+                Pack(stream, member, member.Get(this));
+            }
+        }
+        protected virtual void Pack(Stream stream, CachedType ct, object obj)
+        {
+            if (obj == null)
+            {
+                stream.WriteInt8(0);
+                return;
+            }
+
+            if (!ct.IsValueType)
+                stream.WriteInt8(1);
+
+            ct.WriteFunc(this, ct.Type, stream, obj);
         }
 
+        protected void Pack(Stream stream, object obj)
+        {
+            CachedType ct = GetCachedType(obj.GetType());
+            Pack(stream, ct, obj);
+        }
 
         public virtual void Unpack(Stream stream)
         {
-            var c = GetCachedType(GetType());
-            c.Read(this, stream);
+            List<CachedMember> members = GetCachedMembers(GetType());
+            foreach (CachedMember member in members)
+            {
+                member.Set(this, Unpack(stream, member.Type));
+            }
+        }
+        protected virtual object Unpack(Stream stream, CachedType ct)
+        {
+            if (!ct.IsValueType && stream.ReadInt8() == 0)
+                return null;
+
+            return ct.ReadFunc(this, ct.Type, stream);
         }
 
-        public class CachedReadWrite
+        protected virtual object Unpack(Stream stream, Type type)
         {
-            public Action<object, Stream> Write { get; set; }
-            public Action<object, Stream> Read { get; set; }
+            CachedType ct = GetCachedType(type);
+            return Unpack(stream, ct);
+        }
 
+        public class CachedType
+        {
+            public bool IsValueType { get; set; }
+            public Type Type { get; set; }
+            public Func<BasePackable, Type, Stream, object> ReadFunc { get; set; }
+            public Action<BasePackable, Type, Stream, object> WriteFunc { get; set; }
 
-            public CachedReadWrite(Type type)
+            public CachedType(Type type)
             {
-                Write = CreateWrite(type);
-                Read = CreateRead(type);
+                Type = type;
+                IsValueType = Type.IsValueType;
+
+                ReadFunc = GetReadFunc(Type);
+                WriteFunc = GetWriteFunc(Type);
             }
 
-            public Action<object, Stream> CreateWrite(Type type)
+            Func<BasePackable, Type, Stream, object> GetReadFunc(Type type)
             {
-                var members = GetMembers(type);
-                var ret = new DynamicMethod("Write_" + type.MetadataToken, null, new Type[] { typeof(object), typeof(Stream) });
-                var il = ret.GetILGenerator();
-                foreach (MemberInfo m in members)
+                if (ReadFuncs.ContainsKey(type))
                 {
-                    if (m is FieldInfo)
-                    {
-                        var f = (FieldInfo)m;
-                        il.Emit(OpCodes.Ldarg_1);
-                        il.Emit(OpCodes.Ldarg_0);
-                        il.Emit(OpCodes.Castclass, type);
-                        il.Emit(OpCodes.Ldfld, f);
-                        if (f.FieldType.IsValueType)
-                            il.Emit(OpCodes.Box, f.FieldType);
-                        il.Emit(OpCodes.Call, WriteFuncs[f.FieldType].Method);
-                    }
+                    return ReadFuncs[type];
                 }
-                il.Emit(OpCodes.Ret);
-                return (Action<object, Stream>)ret.CreateDelegate(typeof(Action<object, Stream>));
-            }
-            public Action<object, Stream> CreateRead(Type type)
-            {
-                var members = GetMembers(type);
-                var ret = new DynamicMethod("Read_" + type.MetadataToken, null, new Type[] { typeof(object), typeof(Stream) });
-                var il = ret.GetILGenerator();
-                foreach (MemberInfo m in members)
+                foreach (var t in type.GetInterfaces())
                 {
-                    if (m is FieldInfo)
-                    {
-                        var f = (FieldInfo)m;
-                        il.Emit(OpCodes.Ldarg_0);
-                        il.Emit(OpCodes.Castclass, type);
-                        il.Emit(OpCodes.Ldarg_1);
-                        il.Emit(OpCodes.Call, ReadFuncs[f.FieldType].Method);
-                        if (f.FieldType.IsValueType)
-                            il.Emit(OpCodes.Unbox_Any, f.FieldType);
-                        else
-                            il.Emit(OpCodes.Castclass, f.FieldType);
-                        il.Emit(OpCodes.Stfld, f);
-                    }
+                    if (UnpackInterfaces.ContainsKey(t))
+                        return UnpackInterfaces[t];
                 }
-                il.Emit(OpCodes.Ret);
-                return (Action<object, Stream>)ret.CreateDelegate(typeof(Action<object, Stream>));
+                throw new NotSupportedException();
             }
+            Action<BasePackable, Type, Stream, object> GetWriteFunc(Type type)
+            {
+                if (WriteFuncs.ContainsKey(type))
+                {
+                    return WriteFuncs[type];
+                }
+                foreach (var t in type.GetInterfaces())
+                {
+                    if (PackInterfaces.ContainsKey(t))
+                        return PackInterfaces[t];
+                }
+                throw new NotSupportedException();
+            }
+        }
+        public interface IFastMember
+        {
+            void Set(object obj, object value);
+            object Get(object obj);
+        }
+        public class FastProperty<T, F> : IFastMember
+        {
+            Action<T, F> Setter;
+            Func<T, F> Getter;
+            public FastProperty(PropertyInfo pi)
+            {
+                Setter = (Action<T, F>)Delegate.CreateDelegate(typeof(Action<T, F>), pi.GetSetMethod());
+                Getter = (Func<T, F>)Delegate.CreateDelegate(typeof(Func<T, F>), pi.GetGetMethod());
+            }
+
+            public void Set(object obj, object value)
+            {
+                Setter((T)obj, (F)value);
+            }
+            public object Get(object obj)
+            {
+                return Getter((T)obj);
+            }
+        }
+        public static class FastProperty
+        {
+            public static IFastMember Create(PropertyInfo pi)
+            {
+                return (IFastMember)Activator.CreateInstance(typeof(FastProperty<,>).MakeGenericType(pi.DeclaringType, pi.PropertyType), pi);
+            }
+        }
+        public class CachedMember : CachedType
+        {
+            public MemberInfo Member { get; set; }
+
+            IFastMember fastproperty;
+
+            public void Set(object obj, object value)
+            {
+                if (Member is FieldInfo)
+                    ((FieldInfo)Member).SetValue(obj, value);
+                else if (Member is PropertyInfo)
+                    fastproperty.Set(obj, value);
+                else
+                    throw new NotSupportedException();
+            }
+            public object Get(object obj)
+            {
+                if (Member is FieldInfo)
+                    return ((FieldInfo)Member).GetValue(obj);
+                if (Member is PropertyInfo)
+                    return fastproperty.Get(obj);
+
+                throw new NotSupportedException();
+            }
+
+            public CachedMember(MemberInfo mi)
+                : base(GetMemberType(mi))
+            {
+                Member = mi;
+
+                if (Member is PropertyInfo)
+                    fastproperty = FastProperty.Create((PropertyInfo)Member);
+
+
+            }
+
+
+            static Type GetMemberType(MemberInfo mi)
+            {
+                Type type;
+
+                if (mi is FieldInfo)
+                    type = ((FieldInfo)mi).FieldType;
+                else if (mi is PropertyInfo)
+                    type = ((PropertyInfo)mi).PropertyType;
+                else
+                    throw new NotSupportedException();
+
+                if (type.BaseType == typeof(Enum))
+                    type = Enum.GetUnderlyingType(type);
+
+                return type;
+            }
+
         }
 
         #region Read/Write Functions
-        protected static readonly Dictionary<Type, Func<Stream, object>> ReadFuncs = new Dictionary<Type, Func<Stream, object>>
+        protected static readonly Dictionary<Type, Func<BasePackable, Type, Stream, object>> ReadFuncs = new Dictionary<Type, Func<BasePackable, Type, Stream, object>>
         {
-            {typeof(bool), DefaultFuncs.BooleanFuncs.Read },
-            {typeof(byte), DefaultFuncs.Int8Funcs.Read },
-            {typeof(Int16), DefaultFuncs.Int16Funcs.Read },
-            {typeof(Int32), DefaultFuncs.Int32Funcs.Read },
-            {typeof(Int64), DefaultFuncs.Int64Funcs.Read },
-            {typeof(byte[]), DefaultFuncs.ByteArrayFuncs.Read },
-            {typeof(string), DefaultFuncs.StringFuncs.Read },
+            {typeof(bool), (p, y, s) => s.ReadBoolean() },
+            {typeof(byte), (p, y, s) => s.ReadInt8() },
+            {typeof(Int16), (p, y, s) => s.ReadInt16() },
+            {typeof(Int32), (p, y, s) => s.ReadInt32() },
+            {typeof(Int64), (p, y, s) => s.ReadInt64() },
+            {typeof(byte[]), (p, y, s) => s.ReadBytes() },
+            {typeof(string), (p, y, s) => s.ReadString() },
         };
-        protected static readonly Dictionary<Type, Action<Stream, object>> WriteFuncs = new Dictionary<Type, Action<Stream, object>>
+        protected static readonly Dictionary<Type, Action<BasePackable, Type, Stream, object>> WriteFuncs = new Dictionary<Type, Action<BasePackable, Type, Stream, object>>
         {
-            {typeof(bool), DefaultFuncs.BooleanFuncs.Write },
-            {typeof(byte), DefaultFuncs.Int8Funcs.Write },
-            {typeof(Int16), DefaultFuncs.Int16Funcs.Write },
-            {typeof(Int32), DefaultFuncs.Int32Funcs.Write },
-            {typeof(Int64), DefaultFuncs.Int64Funcs.Write },
-            {typeof(byte[]), DefaultFuncs.ByteArrayFuncs.Write },
-            {typeof(string), DefaultFuncs.StringFuncs.Write },
+            {typeof(bool), (p, y, s, o) => s.WriteBoolean((bool)o) },
+            {typeof(byte), (p, y, s, o) => s.WriteInt8((byte)o) },
+            {typeof(Int16), (p, y, s, o) => s.WriteInt16((Int16)o) },
+            {typeof(Int32), (p, y, s, o) => s.WriteInt32((Int32)o) },
+            {typeof(Int64), (p, y, s, o) => s.WriteInt64((Int64)o) },
+            {typeof(byte[]), (p, y, s, o) => s.WriteBytes((byte[])o) },
+            {typeof(string), (p, y, s, o) => s.WriteString((string)o) },
         };
-
-        public static class DefaultFuncs
-        {
-            public static class BooleanFuncs
-            {
-                public static object Read(Stream stream)
-                {
-                    return stream.ReadBoolean();
-                }
-                public static void Write(Stream stream, object obj)
-                {
-                    stream.WriteBoolean((bool)obj);
-                }
-            }
-            public static class Int8Funcs
-            {
-                public static object Read( Stream stream)
-                {
-                    return stream.ReadInt8();
-                }
-                public static void Write(Stream stream, object obj)
-                {
-                    stream.WriteInt8((byte)obj);
-                }
-            }
-            public static class Int16Funcs
-            {
-                public static object Read(Stream stream)
-                {
-                    return stream.ReadInt16();
-                }
-                public static void Write(Stream stream, object obj)
-                {
-                    stream.WriteInt16((Int16)obj);
-                }
-            }
-            public class Int32Funcs
-            {
-                public static object Read(Stream stream)
-                {
-                    return stream.ReadInt32();
-                }
-                public static void Write(Stream stream, object obj)
-                {
-                    stream.WriteInt32((Int32)obj);
-                }
-            }
-            public class Int64Funcs
-            {
-                public static object Read(Stream stream)
-                {
-                    return stream.ReadInt64();
-                }
-                public static void Write(Stream stream, object obj)
-                {
-                    stream.WriteInt64((Int64)obj);
-                }
-            }
-            public class ByteArrayFuncs
-            {
-                public static object Read(Stream stream)
-                {
-                    return stream.ReadBytes();
-                }
-                public static void Write(Stream stream, object obj)
-                {
-                    stream.WriteBytes((byte[])obj);
-                }
-            }
-            public class StringFuncs
-            {
-                public static object Read(Stream stream)
-                {
-                    return stream.ReadString();
-                }
-                public static void Write(Stream stream, object obj)
-                {
-                    stream.WriteString((string)obj);
-                }
-            }
-
-        }
-
         #endregion
-
     }
-
     public interface IPackable
     {
         void Pack(Stream stream);
@@ -277,30 +358,7 @@ namespace Packable
     }
 
     [AttributeUsage(AttributeTargets.Property | AttributeTargets.Field, Inherited = true, AllowMultiple = false)]
-    public class PackAttribute : Attribute
+    public class DontPackAttribute : Attribute
     {
-        /// <summary>
-        /// Do not serialize
-        /// </summary>
-        public bool Dont { get; set; }
-        /// <summary>
-        /// Apply to members below this member
-        /// </summary>
-        public bool Fall { get; set; }
-        public PackAttribute(bool fall = false, bool dont = false)
-        {
-            Dont = dont;
-            Fall = fall;
-        }
     }
-    [AttributeUsage(AttributeTargets.Property | AttributeTargets.Field, Inherited = true, AllowMultiple = false)]
-    public class DontPackAttribute : PackAttribute
-    {
-        public DontPackAttribute(bool fall = false)
-            : base(fall, true)
-        {
-        }
-    }
-
-
 }

@@ -60,12 +60,12 @@ namespace Packable.StreamBinary
         }
         public static void WriteBytes(this Stream s, byte[] bytes)
         {
-            s.WriteInt32(bytes.Length);
-            s.WriteBytes(bytes, bytes.Length);
+            s.Write(bytes, 0, bytes.Length);
         }
-        public static void WriteBytes(this Stream s, byte[] bytes, Int32 len)
+        public static void WriteBytesWithLength(this Stream s, byte[] bytes)
         {
-            s.Write(bytes, 0, len);
+            s.WriteInt32(bytes.Length);
+            s.WriteBytes(bytes);
         }
         public static void WriteString(this Stream s, string str)
         {

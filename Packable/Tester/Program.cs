@@ -16,6 +16,17 @@ namespace Tester
         [STAThread]
         static void Main(string[] args)
         {
+            {
+                var ms = new MemoryStream();
+                var t1 = new Packtest();
+                ms.Reset();
+                t1.Field9 = null;
+                t1.Pack(ms);
+                ms.Reset();
+                t1.Unpack(ms);
+            }
+            return;
+
             var test1 = new SpeedTest(delegate()
             {
                 var ms = new MemoryStream();
@@ -36,7 +47,7 @@ namespace Tester
                 t2.Unpack(ms);
             });
 
-            
+
             test2.Test();
             test1.Test();
 
@@ -92,19 +103,24 @@ namespace Tester
 
     public class Packtest : BasePackable
     {
-        [DontPack(true)]
+        [DontPack]
         public byte Field1 = 2;
+        [DontPack]
         public short Field2 = 2;
+        [DontPack]
         public int Field3 = 3;
+        [DontPack]
         public byte[] Field4 = new byte[50];
+        [DontPack]
         public string Field5 = "Field5";
 
-        [Pack(true)]
-        public byte Field6;
-        public short Field7;
-        public int Field8;
+        public byte Field6 { get; set; }
+        public short Field7 { get; set; }
+        public int Field8 { get; set; }
         public byte[] Field9;
-        public string Field10;
+        public string Field10 { get; set; }
+
+        //public List<string> Field11 { get; set; }
 
         public Packtest()
         {
@@ -124,11 +140,20 @@ namespace Tester
         public byte[] Field4 = new byte[50];
         public string Field5 = "Field5";
 
-        public byte Field6 = 6;
-        public short Field7 = 7;
-        public int Field8 = 8;
-        public byte[] Field9 = new byte[50];
-        public string Field10 = "Field10";
+        public byte Field6 { get; set; }
+        public short Field7 { get; set; }
+        public int Field8 { get; set; }
+        public byte[] Field9 { get; set; }
+        public string Field10 { get; set; }
+
+        public Packtest2()
+        {
+            Field6 = 6;
+            Field7 = 7;
+            Field8 = 8;
+            Field9 = new byte[50];
+            Field10 = "Field10";
+        }
         public void Pack(Stream stream)
         {
             stream.WriteInt8(Field6);
